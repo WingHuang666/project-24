@@ -694,7 +694,6 @@ for cluster_id in relative_profiles.index:
 
 
 
-
 # 12. Final Comparison and Limitations
 
 The models above print cross-validated selection results, holdout scores, and permutation importance. Results should be interpreted only after running the full document; no accuracy or best model is assumed in advance. Note the absence of exposure-adjusted claim frequency, payment maturity dates/as-of snapshots, fraud labels, and economic profit outcomes. In particular, RQ3 may capture observation-window effects, not stable payment propensity. Categorical variables can be predictive without establishing causality; location and credit-related attributes require fairness and regulatory review before operational insurance use.
