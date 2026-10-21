@@ -1,0 +1,710 @@
+
+# Project_24
+## Title: "Auto Insurance Claims Project: Integrated Data and Predictive Analytics"
+
+
+# 1. Setup and Research Design
+
+This project integrates five relational tables at **one row per claim**. The first run exports `auto_insurance_claims_merged.csv`, which is then reloaded for all analyses. Place the five source CSV files in the same folder as this QMD. Install dependencies if needed: `pip install pandas numpy matplotlib seaborn scikit-learn`.
+
+**Questions:** RQ1: What predicts the initial claimed amount? RQ2: What predicts reporting delay? RQ3: Which claims are likely to have any payment recorded? RQ4: How well can recorded payment amounts be estimated among paid claims? RQ5: What meaningful claim-risk segments emerge from clustering?
+
+These are predictive/associational questions, not causal claims. Claim outcomes and payment records are snapshots; a zero payment is not necessarily a denial. RQ1–RQ3 use information plausibly known at or shortly after reporting. RQ4 is explicitly a **retrospective estimation** task using claim attributes but excluding realized payment features. RQ5 is descriptive. No fraud labels or actual underwriting profit data are available; fraud detection and true profitability cannot be answered.
+
+```{python}
+from pathlib import Path
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, cross_validate
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, RandomForestClassifier, ExtraTreesClassifier
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, average_precision_score, roc_auc_score, f1_score, balanced_accuracy_score, classification_report, confusion_matrix, silhouette_score
+from sklearn.cluster import KMeans
+from sklearn.inspection import permutation_importance
+
+RANDOM_STATE = 42
+DATA_DIR = Path('.')
+sns.set_theme(style='whitegrid')
+```
+
+# 2. Relational Merge and Export
+
+Aggregate payment-level information before joining to avoid duplicating claims. Preserve distinct payees and payment methods as delimiter-separated categories, plus transaction counts. This file is the reusable integrated dataset.
+
+```{python}
+read = lambda name: pd.read_csv(DATA_DIR / f'{name}.csv', low_memory=False)
+claims = read('claims')
+policies = read('policies')
+holders = read('policyholders')
+vehicles = read('vehicles')
+payments = read('claim_payments')
+
+for name, frame, key in [('claims',claims,'claim_id'),('policies',policies,'policy_id'),('holders',holders,'policyholder_id'),('vehicles',vehicles,'vehicle_id'),('payments',payments,'payment_id')]:
+    assert frame[key].is_unique, f'{name} has duplicate primary keys'
+
+def unique_join(series):
+    return ' | '.join(sorted(set(series.dropna().astype(str))))
+
+payment_summary = payments.groupby('claim_id').agg(
+    payment_count=('payment_id','size'),
+    payment_amount_sum=('amount','sum'),
+    payment_amount_mean=('amount','mean'),
+    first_payment_on=('paid_on','min'),
+    last_payment_on=('paid_on','max'),
+    payment_payees=('payee',unique_join),
+    payment_methods=('method',unique_join)
+).reset_index()
+
+merged = (claims.merge(policies, on='policy_id', how='left', validate='many_to_one', suffixes=('_claim','_policy'))
+          .merge(holders, on='policyholder_id', how='left', validate='many_to_one')
+          .merge(vehicles, on='vehicle_id', how='left', validate='many_to_one')
+          .merge(payment_summary, on='claim_id', how='left', validate='one_to_one'))
+assert len(merged) == len(claims) and merged.claim_id.is_unique
+merged['payment_count'] = merged['payment_count'].fillna(0).astype(int)
+merged['payment_amount_sum'] = merged['payment_amount_sum'].fillna(0)
+merged.to_csv(DATA_DIR / 'auto_insurance_claims_merged.csv', index=False)
+print('Exported:', DATA_DIR / 'auto_insurance_claims_merged.csv', 'shape:', merged.shape)
+print('Missing joined policy IDs:', merged.policyholder_id.isna().sum())
+print('Claims with payments:', (merged.payment_count > 0).sum())
+print('Paid-total reconciliation (summary; differences may reflect data timing):')
+print((merged.paid_total - merged.payment_amount_sum).describe().round(2))
+```
+
+# 3. Reload Integrated Dataset and Engineer Features
+
+The model deliberately excludes personal names, VINs, policy numbers, identifiers, raw dates, and post-outcome features where inappropriate. Dates are transformed into age, experience, vehicle age, reporting delay, and temporal components. Dates are used as approximate values, not evidence of causation.
+
+```{python}
+df = pd.read_csv(DATA_DIR / 'auto_insurance_claims_merged.csv', low_memory=False)
+for c in ['loss_date','reported_on','date_of_birth','licensed_since','start_date','end_date','first_payment_on','last_payment_on']:
+    df[c] = pd.to_datetime(df[c], errors='coerce')
+df['driver_age_at_loss'] = (df.loss_date - df.date_of_birth).dt.days / 365.25
+df['years_licensed_at_loss'] = (df.loss_date - df.licensed_since).dt.days / 365.25
+df['vehicle_age_at_loss'] = df.loss_date.dt.year - df.model_year
+df['report_delay_days'] = (df.reported_on - df.loss_date).dt.days
+df['loss_month'] = df.loss_date.dt.month
+df['loss_year'] = df.loss_date.dt.year
+df['policy_active_at_loss'] = ((df.loss_date >= df.start_date) & (df.loss_date <= df.end_date)).astype(int)
+df['any_payment_recorded'] = (df.payment_count > 0).astype(int)
+df['paid_recorded_amount'] = df.payment_amount_sum
+
+# Flags rather than deleting suspicious values without review.
+for c in ['driver_age_at_loss','years_licensed_at_loss','vehicle_age_at_loss','report_delay_days']:
+    print(c, df[c].describe().round(2).to_dict())
+    print('Negative count:', (df[c] < 0).sum())
+    df.loc[df[c] < 0, c] = np.nan
+```
+
+# 4. Text Audit and Information-Preserving Encoding
+
+Categorical strings are not discarded or assigned arbitrary ordinal numbers. Single-label categories use One-Hot Encoding; multi-label payment cells are split into independent indicator columns. These payment indicators are reserved for descriptive analysis, **never** for predicting whether a payment occurs. High-cardinality IDs and names are excluded for privacy/generalization, while vehicle make/model and location categories remain available.
+
+```{python}
+text_cols = df.select_dtypes(include=['object','string']).columns.tolist()
+audit = pd.DataFrame([{'variable':c, 'unique_values':df[c].nunique(dropna=True),
+                       'missing_pct':round(df[c].isna().mean()*100,2),
+                       'contains_pipe':int(df[c].dropna().astype(str).str.contains('|',regex=False).sum()),
+                       'examples':' ; '.join(df[c].dropna().astype(str).unique()[:3])[:140]}
+                      for c in text_cols]).sort_values('unique_values',ascending=False)
+print(audit.to_string(index=False))
+
+for col in ['payment_payees','payment_methods']:
+    labels = sorted({v.strip() for cell in df[col].dropna().astype(str) for v in cell.split('|') if v.strip()})
+    for label in labels:
+        df[f'{col}__{label}'] = df[col].fillna('').astype(str).apply(lambda s: int(label in [v.strip() for v in s.split('|')]))
+print('Payment-category flags:', [c for c in df if c.startswith(('payment_payees__','payment_methods__'))])
+```
+
+# 5. Exploratory Data Analysis
+
+Plots are tied to the questions: target distributions, payment incidence by peril, reporting delay, and risk mix. These figures are descriptive and may be confounded by exposure and claim maturity.
+
+```{python}
+fig, ax = plt.subplots(figsize=(9,4))
+sns.histplot(np.log1p(df.claim_amount.clip(lower=0)), bins=45, ax=ax)
+ax.set(xlabel='log(1 + claimed amount)', title='RQ1: Skew in claim severity')
+plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(1,2,figsize=(13,4))
+order = df.groupby('peril').any_payment_recorded.mean().sort_values().index
+sns.barplot(data=df, x='any_payment_recorded', y='peril', order=order, errorbar=None, ax=axes[0])
+axes[0].set(title='Recorded-payment share by peril', xlabel='Share')
+sns.histplot(df.report_delay_days.dropna().clip(upper=df.report_delay_days.quantile(.99)), bins=35, ax=axes[1])
+axes[1].set(title='RQ2: Reporting delay (top 1% clipped for display)', xlabel='Days')
+plt.tight_layout(); plt.show()
+
+fig, ax = plt.subplots(figsize=(9,4))
+sns.boxplot(data=df, x='credit_band', y='claim_amount', showfliers=False, ax=ax)
+ax.set(title='Claim amount by credit band (outliers hidden visually)')
+plt.tight_layout(); plt.show()
+```
+
+
+### EDA Interpretation and Preliminary Findings
+
+The exploratory analysis reveals several important characteristics of the auto insurance claims dataset.
+
+First, the log-transformed claim amount distribution exhibits an irregular shape, suggesting that claim severity may follow multiple underlying distributions or data-generation mechanisms rather than a single conventional right-skewed distribution.
+
+Second, the proportion of claims with recorded payments is relatively consistent across different peril categories, ranging approximately from 76% to 79%. This suggests that peril type alone may have limited discriminatory power for predicting payment incidence.
+
+Third, reporting delays are distributed almost uniformly between 0 and 10 days. This pattern raises the possibility that reporting delays were generated using a simplified or randomized mechanism, potentially limiting their predictability.
+
+Finally, claim amount distributions are nearly identical across credit bands. This suggests that credit band may have limited predictive value for claim severity.
+
+These findings emphasize the importance of comparing complex machine learning models against simple baseline models. If more sophisticated models fail to achieve meaningful improvements, this should be interpreted as a substantive research finding rather than a modeling failure.
+
+The analysis should also acknowledge that the dataset may contain synthetic or simplified relationships that do not fully represent real-world insurance claim behavior.
+
+
+
+
+
+
+
+# 6. Common Leakage-Aware Modeling Functions
+
+Each question compares a baseline and three candidate models. A fixed 80/20 holdout is reserved for final evaluation; model selection uses 3-fold cross-validation on training data only. For regressions, **MAE** is primary because amounts and days have interpretable units and are often skewed; RMSE and R² are secondary. For the imbalanced binary task, **average precision (PR-AUC)** is primary, with ROC-AUC and F1 as secondary diagnostics. Permutation importance is computed on held-out data with the same task-specific primary metric, including for models without native importances.
+
+```{python}
+base_num = ['deductible','annual_premium','market_value','driver_age_at_loss',
+            'years_licensed_at_loss','vehicle_age_at_loss','loss_month','loss_year','policy_active_at_loss']
+base_cat = ['coverage','credit_band','state','city','make','model','body_type','loss_state','peril']
+# Reporting delay is known only after a report arrives.
+reported_num = base_num + ['report_delay_days']
+
+def make_preprocessor(features):
+    nums = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
+    cats = [c for c in features if c not in nums]
+    return ColumnTransformer([
+        ('numeric',Pipeline([('imputer',SimpleImputer(strategy='median')),('scale',StandardScaler())]),nums),
+        ('categorical',Pipeline([('imputer',SimpleImputer(strategy='most_frequent')),
+                                ('onehot',OneHotEncoder(handle_unknown='ignore'))]),cats)
+    ], sparse_threshold=0.3)
+
+def run_regression(question, target, features, subset=None, log_target=True):
+    work = df.loc[subset].copy() if subset is not None else df.copy()
+    work = work.dropna(subset=[target]); work = work.loc[work[target] >= 0]
+    X = work[features]; y = np.log1p(work[target]) if log_target else work[target]
+    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=.2,random_state=RANDOM_STATE)
+    candidates = {
+        'Dummy median':DummyRegressor(strategy='median'),
+        'Ridge':Ridge(alpha=10),
+        'Random Forest':RandomForestRegressor(n_estimators=90,min_samples_leaf=5,max_features=.8,n_jobs=-1,random_state=RANDOM_STATE),
+        'Extra Trees':ExtraTreesRegressor(n_estimators=90,min_samples_leaf=5,max_features=.8,n_jobs=-1,random_state=RANDOM_STATE)
+    }
+    # Cross-validate on original units, including when fitting log(target).
+    def original_mae(est,Xv,yv):
+        pred=est.predict(Xv)
+        return -mean_absolute_error(np.expm1(yv) if log_target else yv,
+                                    np.maximum(0,np.expm1(pred)) if log_target else np.maximum(0,pred))
+    cv = KFold(n_splits=3,shuffle=True,random_state=RANDOM_STATE)
+    scores=[]
+    for name,model in candidates.items():
+        pipe=Pipeline([('prep',make_preprocessor(features)),('model',model)])
+        res=cross_validate(pipe,Xtr,ytr,cv=cv,scoring=original_mae,n_jobs=1)
+        scores.append((name,-res['test_score'].mean(),res['test_score'].std()))
+    leaderboard=pd.DataFrame(scores,columns=['model','CV_MAE','CV_score_SD']).sort_values('CV_MAE')
+    print('\n',question,'\n',leaderboard.to_string(index=False))
+    winner=leaderboard.iloc[0]['model']
+    best=Pipeline([('prep',make_preprocessor(features)),('model',candidates[winner])]).fit(Xtr,ytr)
+    predictions=best.predict(Xte)
+    actual=np.expm1(yte) if log_target else yte
+    predicted=np.maximum(0,np.expm1(predictions)) if log_target else np.maximum(0,predictions)
+    print('Best:',winner,'| HOLDOUT MAE:',round(mean_absolute_error(actual,predicted),3),
+          '| RMSE:',round(np.sqrt(mean_squared_error(actual,predicted)),3),
+          '| R2:',round(r2_score(actual,predicted),3))
+    def score_orig(est,Xv,yv): return original_mae(est,Xv,yv)
+    show_importance(best,Xte,yte,features,score_orig,question)
+    fig,ax=plt.subplots(figsize=(6,5));ax.scatter(actual,predicted,s=8,alpha=.2)
+    lim=max(np.percentile(actual,99),np.percentile(predicted,99));ax.plot([0,lim],[0,lim],'--',color='black')
+    ax.set(xlim=(0,lim),ylim=(0,lim),xlabel='Actual',ylabel='Predicted',title=f'{question}: holdout predictions (99th percentile axes)')
+    plt.tight_layout();plt.show()
+    return best,leaderboard
+
+def show_importance(model,Xte,yte,features,scorer,title):
+    # Sample holdout rows for feasible runtime; importance refers to original input columns.
+    xs=Xte.sample(n=min(1200,len(Xte)),random_state=RANDOM_STATE)
+    ys=yte.loc[xs.index]
+    pi=permutation_importance(model,xs,ys,n_repeats=3,random_state=RANDOM_STATE,
+                              scoring=scorer,n_jobs=1)
+    importance=pd.Series(pi.importances_mean,index=features).sort_values(ascending=False).head(12)
+    print('Top permutation importances (drop in primary score):\n',importance.round(4).to_string())
+    fig,ax=plt.subplots(figsize=(8,4));importance.sort_values().plot.barh(ax=ax)
+    ax.set(title=f'{title}: held-out permutation importance',xlabel='Score decrease when shuffled')
+    plt.tight_layout();plt.show()
+```
+
+
+
+
+# 7. RQ1 — Predict Initial Claim Amount
+
+**Question:** Which pre-payment characteristics are most informative about claimed severity? Compare a median baseline, Ridge, Random Forest and Extra Trees. Primary metric: original-dollar MAE, after log-target modeling. Claim amount is not included among predictors.
+
+```{python}
+rq1_model, rq1_scores = run_regression('RQ1 Claim Amount','claim_amount',reported_num+base_cat)
+```
+
+
+### RQ1 — Claim Amount Prediction: Results and Interpretation
+
+**Model Comparison**
+
+Four regression models were evaluated using cross-validation MAE as the primary selection metric. Ridge Regression achieved the lowest CV MAE of 4,597.38, followed by Random Forest (4,651.29), Extra Trees (4,701.47), and Dummy Median (5,146.84).
+
+Ridge improved MAE by approximately 10.7% compared with the baseline, suggesting that some predictive information exists in the available features.
+
+**Holdout Performance**
+
+On the independent test set, Ridge achieved an MAE of 4,729.14, RMSE of 10,886.61, and R² of -0.016.
+
+The negative R² indicates that the model does not adequately explain variation in claim amounts under squared-error evaluation. The prediction scatterplot further shows that predictions are concentrated around a relatively narrow range, even when actual claim amounts vary substantially.
+
+**Feature Importance**
+
+Permutation importance identifies peril as the dominant predictive feature, with an estimated MAE-based importance of 796.86. All remaining features have considerably smaller contributions, suggesting that claim type contains most of the useful predictive information captured by the model.
+
+**Conclusion**
+
+Ridge Regression is the best-performing candidate according to cross-validation MAE, but its overall predictive performance remains limited. The findings suggest that claim type contributes useful information, while demographic, vehicle, and policy characteristics provide relatively little additional predictive value.
+
+Future improvements could include evaluating log-transformed claim amounts, comparing alternative loss functions, and examining predictive performance separately for high-severity claims.
+
+
+
+
+
+
+
+# 8. RQ2 — Predict Claim Reporting Delay
+
+**Question:** Can policyholder, policy, vehicle and incident context explain how long reporting takes? No report-date-derived predictors or post-report outcomes are used. Primary metric: MAE in days.
+
+```{python}
+rq2_model, rq2_scores = run_regression('RQ2 Reporting Delay','report_delay_days',base_num+base_cat,log_target=True)
+```
+
+
+### RQ2 — Reporting Delay Prediction: Results and Interpretation
+
+**Model Comparison**
+
+Four regression models were evaluated using cross-validation Mean Absolute Error (MAE) as the primary selection metric.
+
+Dummy Median achieved the lowest CV MAE of 2.7356 days, outperforming Ridge Regression (2.8520), Random Forest (2.8874), and Extra Trees (2.8908).
+
+These results indicate that none of the more sophisticated models provided an improvement over the baseline.
+
+**Holdout Performance**
+
+The selected Dummy Median model achieved a holdout MAE of 2.748 days, RMSE of 3.182 days, and an R² approximately equal to zero.
+
+The prediction scatterplot shows a constant predicted reporting delay of five days across all actual reporting delays.
+
+This is expected because Dummy Median predicts the median target value observed in the training data, regardless of the input features.
+
+**Feature Importance**
+
+All permutation importance values for the selected Dummy Median model were zero because this baseline estimator does not use input features.
+
+Consequently, these results cannot establish whether individual variables are associated with reporting delays.
+
+Ridge Regression, the second-best model according to CV MAE, can be used for supplementary feature importance analysis. However, because Ridge performs worse than the baseline, any feature importance findings should be interpreted cautiously.
+
+**Conclusion**
+
+The results suggest that reporting delays are difficult to predict using the available policyholder, vehicle, and policy characteristics.
+
+The nearly uniform distribution of reporting delays observed during EDA may indicate a simplified or randomized data-generation mechanism.
+
+More complex machine learning models do not necessarily outperform simple statistical baselines when the available predictors contain limited information about the target variable.
+
+
+
+
+
+
+# 9. RQ3 — Predict Whether a Payment Is Recorded
+
+**Question:** Can information available at claim reporting distinguish claims with any recorded payment from claims without a recorded payment? This is **not** a model of claim approval, fraud or ultimate payment. It is subject to censoring: newer/open claims may not yet be paid. Claim amount and reserve amount may be recorded/updated during handling; only initial claim amount is used, and it should be removed if initial values are unavailable. Primary metric: PR-AUC.
+
+```{python}
+features3 = reported_num + ['claim_amount'] + base_cat
+X=df[features3]; y=df.any_payment_recorded
+Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,stratify=y,random_state=RANDOM_STATE)
+models3={
+    'Dummy prior':DummyClassifier(strategy='prior'),
+    'Logistic Regression':LogisticRegression(max_iter=1500,class_weight='balanced'),
+    'Random Forest':RandomForestClassifier(n_estimators=90,min_samples_leaf=5,n_jobs=-1,random_state=RANDOM_STATE,class_weight='balanced_subsample'),
+    'Extra Trees':ExtraTreesClassifier(n_estimators=90,min_samples_leaf=5,n_jobs=-1,random_state=RANDOM_STATE,class_weight='balanced')
+}
+cv3=StratifiedKFold(n_splits=3,shuffle=True,random_state=RANDOM_STATE)
+rows=[]
+for name,est in models3.items():
+    pipe=Pipeline([('prep',make_preprocessor(features3)),('model',est)])
+    scores=cross_validate(pipe,Xtr,ytr,cv=cv3,scoring={'ap':'average_precision','auc':'roc_auc'},n_jobs=1)
+    rows.append({'model':name,'CV_PR_AUC':scores['test_ap'].mean(),'CV_ROC_AUC':scores['test_auc'].mean()})
+rq3_scores=pd.DataFrame(rows).sort_values('CV_PR_AUC',ascending=False)
+print(rq3_scores.to_string(index=False))
+name3=rq3_scores.iloc[0]['model']
+rq3_model=Pipeline([('prep',make_preprocessor(features3)),('model',models3[name3])]).fit(Xtr,ytr)
+prob=rq3_model.predict_proba(Xte)[:,1]
+print('Best:',name3,'| HOLDOUT PR-AUC:',round(average_precision_score(yte,prob),4),
+      '| ROC-AUC:',round(roc_auc_score(yte,prob),4),
+      '| positive prevalence:',round(yte.mean(),4))
+# Default threshold 0.5 is illustrative, not optimized.
+print(classification_report(yte,(prob>=.5).astype(int),zero_division=0))
+show_importance(rq3_model,Xte,yte,features3,'average_precision','RQ3 Payment Incidence')
+```
+
+
+
+### RQ3 — Payment Incidence Prediction: Results and Interpretation
+
+**Model Comparison**
+
+Three classification models and a baseline were evaluated using cross-validation PR-AUC as the primary model selection metric.
+
+Random Forest achieved the highest CV PR-AUC of 0.8591, followed by Logistic Regression (0.8562), Extra Trees (0.8552), and Dummy Prior (0.7769).
+
+Random Forest also achieved a CV ROC-AUC of 0.7088, indicating moderate discriminatory ability.
+
+Although Random Forest ranked first, its PR-AUC advantage over Logistic Regression was small, suggesting that more complex models provided only marginal additional benefit.
+
+**Holdout Performance**
+
+Random Forest achieved a holdout PR-AUC of 0.8539, ROC-AUC of 0.7001, and accuracy of approximately 81%.
+
+The positive class represented 77.69% of the holdout observations. Therefore, the relatively high PR-AUC should be interpreted in relation to the high baseline positive prevalence.
+
+The classification report showed a recall of 0.92 for claims with recorded payments but only 0.45 for claims without recorded payments.
+
+This indicates that the model performs substantially better at identifying payment-positive claims than payment-negative claims.
+
+**Feature Importance**
+
+Permutation importance identified loss year as the most influential feature, with a PR-AUC decrease of 0.0589 when shuffled.
+
+Other contributing variables included loss month (0.0091), market value (0.0087), coverage (0.0065), and annual premium (0.0059).
+
+The dominance of loss year suggests that temporal factors may be important in predicting whether a claim has a recorded payment.
+
+However, this relationship may reflect differences in claim maturity or observation-window effects rather than underlying insurance risk.
+
+**Conclusion**
+
+Random Forest was the best-performing candidate for predicting recorded payment incidence, demonstrating moderate discriminatory ability and outperforming the baseline.
+
+Nevertheless, performance remained uneven across classes, particularly for claims without recorded payments.
+
+Future analysis should investigate temporal effects, possible right censoring, and whether the model generalizes to claims occurring in later periods.
+
+
+
+
+
+
+
+# 10. RQ4 — Estimate Recorded Payment Amount for Paid Claims
+
+**Question:** Among claims with at least one payment, how well can the recorded payment total be estimated using claim and policy context? The selection of paid claims and accumulated totals makes this a **retrospective, conditional** task, not a prospective claim-settlement forecast. Payment counts, methods, payees, reserve and `paid_total` are excluded. Primary metric: MAE in dollars.
+
+```{python}
+paid_mask = (df.any_payment_recorded == 1) & (df.paid_recorded_amount >= 0)
+rq4_model,rq4_scores=run_regression('RQ4 Recorded Payment Amount','paid_recorded_amount',
+                                   reported_num+['claim_amount']+base_cat,
+                                   subset=paid_mask,log_target=True)
+```
+
+
+### RQ4 — Recorded Payment Amount Prediction: Results and Interpretation
+
+**Model Comparison**
+
+Four regression models were evaluated using cross-validation Mean Absolute Error (MAE) as the primary selection metric.
+
+Random Forest achieved the lowest CV MAE of 752.70, followed closely by Extra Trees (753.10). Ridge Regression (2,834.27) and Dummy Median (4,192.00) performed substantially worse.
+
+Random Forest reduced cross-validation MAE by approximately 82.0% compared with the baseline. However, the difference between Random Forest and Extra Trees was negligible.
+
+**Holdout Performance**
+
+The selected Random Forest model achieved a holdout MAE of 742.66, RMSE of 1,552.32, and R² of 0.968.
+
+The prediction scatterplot shows that predicted payment amounts closely follow actual payment amounts, indicating strong predictive performance.
+
+However, prediction errors become more dispersed for high-value payments, suggesting that extreme claims remain more difficult to estimate accurately.
+
+**Feature Importance**
+
+Permutation importance identified claim_amount as the overwhelmingly dominant predictor, with an estimated MAE increase of 5,477.98 when shuffled.
+
+Peril was the second most important feature (173.14), while all remaining features contributed relatively little additional predictive information.
+
+This suggests that recorded payment amounts are primarily explained by the claimed amounts, with some additional variation associated with the type of insured loss.
+
+**Potential Data Leakage and Interpretation**
+
+The strong predictive performance requires careful interpretation because claim_amount may be closely related to the target variable.
+
+Using claim_amount is appropriate when the prediction is made after the claimed amount has become available. However, it may introduce temporal leakage if the intended application is to predict payment amounts before claim valuation.
+
+An additional sensitivity analysis excluding claim_amount is recommended to evaluate the independent predictive contribution of the remaining features.
+
+**Conclusion**
+
+Random Forest achieved excellent predictive performance for recorded payment amounts, substantially outperforming the baseline and linear regression.
+
+Nevertheless, this performance was largely driven by claim_amount. The model should therefore be interpreted as a payment estimation model conditional on a known claimed amount, rather than a general early-stage insurance risk prediction model.
+
+
+
+
+
+
+
+
+# 11. RQ5 — Cluster Claim Profiles
+
+**Question:** Are there interpretable groups of claims based on severity, reporting delay, driver experience and vehicle/policy characteristics? We use **Elbow (inertia)** and **silhouette** together, rather than maximizing silhouette alone. Clustering uses numeric standardized features and log transforms for heavy-tailed monetary variables. The elbow is estimated from the relative reduction in inertia; the chosen k must have silhouette within 0.02 of the best score where possible, and should be substantively interpretable. Silhouette is computed on a sample for speed. Inspect small/outlier clusters before accepting a segmentation.
+
+```{python}
+cluster_cols=['claim_amount','report_delay_days','driver_age_at_loss','years_licensed_at_loss',
+              'vehicle_age_at_loss','market_value','annual_premium','deductible']
+Z=df[cluster_cols].copy()
+for c in ['claim_amount','report_delay_days','market_value','annual_premium']:
+    Z[c]=np.log1p(Z[c].clip(lower=0))
+Z=pd.DataFrame(SimpleImputer(strategy='median').fit_transform(Z),columns=cluster_cols,index=df.index)
+Z=StandardScaler().fit_transform(Z)
+ks=list(range(2,9)); inertias=[]; silhouettes=[]
+for k in ks:
+    km=KMeans(n_clusters=k,n_init=10,random_state=RANDOM_STATE).fit(Z)
+    inertias.append(km.inertia_)
+    silhouettes.append(silhouette_score(Z,km.labels_,sample_size=min(3000,len(Z)),random_state=RANDOM_STATE))
+fig,axs=plt.subplots(1,2,figsize=(12,4))
+axs[0].plot(ks,inertias,'o-');axs[0].set(title='Elbow: within-cluster inertia',xlabel='k',ylabel='Inertia')
+axs[1].plot(ks,silhouettes,'o-');axs[1].set(title='Silhouette by k',xlabel='k',ylabel='Silhouette')
+plt.tight_layout();plt.show()
+reductions=np.array([(inertias[i-1]-inertias[i])/inertias[i-1] for i in range(1,len(ks))])
+# Elbow heuristic: first k where the next incremental inertia improvement falls below 10%.
+elbow_candidates=[ks[i] for i in range(1,len(ks)) if reductions[i-1] < .10]
+elbow_k=elbow_candidates[0] if elbow_candidates else ks[1+int(np.argmin(np.abs(np.diff(reductions))))]
+max_sil=max(silhouettes)
+acceptable=[k for k,s in zip(ks,silhouettes) if s >= max_sil-.02]
+chosen_k=min(acceptable,key=lambda k:(abs(k-elbow_k),k))
+print('Elbow heuristic k:',elbow_k,'| max silhouette:',round(max_sil,4),
+      '| silhouette-near-best k:',acceptable,'| chosen k:',chosen_k)
+km=KMeans(n_clusters=chosen_k,n_init=15,random_state=RANDOM_STATE)
+df['cluster']=km.fit_predict(Z)
+profile=df.groupby('cluster')[cluster_cols+['any_payment_recorded']].median().round(2)
+profile['count']=df.groupby('cluster').size()
+profile['payment_share']=df.groupby('cluster').any_payment_recorded.mean().round(3)
+print(profile.to_string())
+fig,ax=plt.subplots(figsize=(11,5))
+sns.heatmap(df.groupby('cluster')[cluster_cols].median().apply(lambda s:(s-s.mean())/(s.std() if s.std() else 1)),
+            cmap='vlag',center=0,annot=True,fmt='.1f',ax=ax)
+ax.set(title='Relative cluster profiles (standardized cluster medians)')
+plt.tight_layout();plt.show()
+```
+
+
+### RQ5 — Claim Risk Profiles: K-Means Clustering Results and Interpretation
+
+**Cluster Selection**
+
+K-Means clustering was evaluated using both the Elbow Method and Silhouette Score for k values ranging from 2 to 8.
+
+The Elbow Method suggested that the reduction in within-cluster inertia became more gradual after approximately k = 4.
+
+The highest Silhouette Score was 0.1909 at k = 4, supporting the selection of four clusters.
+
+Although k = 4 was the preferred solution, the relatively low Silhouette Score indicates substantial overlap between clusters. Therefore, the identified groups should be interpreted as exploratory profiles rather than clearly separated risk categories.
+
+**Cluster Characteristics**
+
+Four distinct profiles were identified:
+
+- **Cluster 0 — High-Deductible Policyholders (n = 5,006):** Characterized by a relatively high deductible of $2,000, a median claim amount of approximately $4,779, and a recorded-payment share of 78.6%.
+
+- **Cluster 1 — Older, Lower-Value Vehicles (n = 10,534):** Characterized by older vehicles (13 years), lower vehicle market values (approximately $8,832), and a recorded-payment share of 77.0%.
+
+- **Cluster 2 — Younger, Less-Experienced Drivers (n = 17,328):** Characterized by younger drivers (approximately 35.75 years old), fewer years licensed (17.23), and relatively high vehicle market values (approximately $34,355). The recorded-payment share was 78.1%.
+
+- **Cluster 3 — Older, Experienced Drivers (n = 17,132):** Characterized by older drivers (approximately 68.49 years old), extensive driving experience (49.95 years licensed), and relatively high vehicle market values (approximately $34,194). The recorded-payment share was 77.5%.
+
+**Key Findings**
+
+The clusters were primarily differentiated by driver age, driving experience, vehicle age, market value, and deductible.
+
+Driver age and years licensed displayed similar patterns, suggesting that correlated variables may influence the clustering structure.
+
+Reporting delays were nearly identical across clusters, consistent with the weak predictive relationships observed in RQ2.
+
+Despite differences in demographic and vehicle characteristics, claim amount medians and recorded-payment shares were relatively similar across all four clusters.
+
+The recorded-payment share ranged from 77.0% to 78.6%, a difference of only 1.6 percentage points.
+
+**Interpretation**
+
+The clustering analysis identified meaningful differences in policyholder and vehicle profiles but did not reveal strong differences in the observed claim outcomes.
+
+Consequently, the four clusters are more appropriately described as policyholder and vehicle segments rather than distinct insurance risk levels.
+
+The relatively low Silhouette Score also indicates that the segmentation structure is weak and should not be treated as definitive.
+
+**Conclusion**
+
+The combined Elbow and Silhouette analysis supports selecting k = 4 as a reasonable exploratory clustering solution.
+
+The results demonstrate that unsupervised learning can identify interpretable customer and vehicle profiles even when those profiles do not correspond to substantially different claim outcomes.
+
+Future research could examine cluster stability, remove highly correlated features, and investigate whether additional claim-history variables produce more meaningful risk differentiation.
+
+
+
+# Section — Cluster Visualization
+```{python}
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+cluster_features = [
+    "claim_amount",
+    "report_delay_days",
+    "driver_age_at_loss",
+    "years_licensed_at_loss",
+    "vehicle_age_at_loss",
+    "market_value",
+    "annual_premium",
+    "deductible"
+]
+
+# Prepare numerical features
+X_cluster = df[cluster_features].copy()
+X_cluster = X_cluster.fillna(X_cluster.median())
+
+# Standardize features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_cluster)
+
+# PCA dimensionality reduction
+pca = PCA(n_components=2, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+
+pca_df = pd.DataFrame({
+    "PC1": X_pca[:, 0],
+    "PC2": X_pca[:, 1],
+    "Cluster": df["cluster"].values
+})
+
+plt.figure(figsize=(10, 7))
+
+sns.scatterplot(
+    data=pca_df.sample(
+        n=min(5000, len(pca_df)),
+        random_state=42
+    ),
+    x="PC1",
+    y="PC2",
+    hue="Cluster",
+    palette="tab10",
+    alpha=0.5,
+    s=18
+)
+
+plt.title("PCA Visualization of Insurance Claim Clusters")
+plt.xlabel(
+    f"PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)"
+)
+plt.ylabel(
+    f"PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)"
+)
+plt.legend(title="Cluster")
+plt.tight_layout()
+plt.show()
+
+
+
+```
+
+
+
+
+
+# Section — Individual Cluster Profiles
+```{python}
+
+import numpy as np
+
+profile_features = [
+    "claim_amount",
+    "driver_age_at_loss",
+    "years_licensed_at_loss",
+    "vehicle_age_at_loss",
+    "market_value",
+    "annual_premium",
+    "deductible"
+]
+
+# Median of each feature across all claims
+overall_median = df[profile_features].median()
+
+# Cluster-specific medians
+cluster_medians = df.groupby("cluster")[profile_features].median()
+
+# Standardize cluster medians for comparison
+overall_std = df[profile_features].std().replace(0, np.nan)
+
+relative_profiles = (
+    (cluster_medians - overall_median) / overall_std
+).fillna(0)
+
+for cluster_id in relative_profiles.index:
+
+    values = relative_profiles.loc[cluster_id]
+
+    plt.figure(figsize=(10, 5))
+
+    sns.barplot(
+        x=values.values,
+        y=values.index,
+        color="steelblue"
+    )
+
+    plt.axvline(0, color="black", linestyle="--")
+    plt.title(f"Cluster {cluster_id}: Relative Feature Profile")
+    plt.xlabel("Standardized Difference from Overall Median")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.show()
+
+```
+
+
+
+
+# 12. Final Comparison and Limitations
+
+The models above print cross-validated selection results, holdout scores, and permutation importance. Results should be interpreted only after running the full document; no accuracy or best model is assumed in advance. Note the absence of exposure-adjusted claim frequency, payment maturity dates/as-of snapshots, fraud labels, and economic profit outcomes. In particular, RQ3 may capture observation-window effects, not stable payment propensity. Categorical variables can be predictive without establishing causality; location and credit-related attributes require fairness and regulatory review before operational insurance use.
+
+```{python}
+print('Regression CV leaderboards (lower MAE is better):')
+for name,scores in [('RQ1',rq1_scores),('RQ2',rq2_scores),('RQ4',rq4_scores)]:
+    print('\n'+name);print(scores.to_string(index=False))
+print('\nRQ3 classification CV leaderboard (higher PR-AUC is better):')
+print(rq3_scores.to_string(index=False))
+print('\nCluster sizes:');print(df.cluster.value_counts().sort_index().to_string())
+print('\nIntegrated dataset saved as auto_insurance_claims_merged.csv')
+```
